@@ -172,6 +172,30 @@ def test_run_slash_reclaim_running_task(kanban_home):
 
 
 
+def test_complete_never_claimed_task_requires_manual_flag(kanban_home):
+    """`kanban complete` on a task with no live claim and no run on record
+    must refuse without --manual, and succeed (flagging manual_override)
+    once it's passed (t_c2fb9cfc)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="never touched", assignee="worker")
+
+    refused = kc.run_slash(f"complete {tid} --summary 'closing directly'")
+    assert "--manual" in refused, refused
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+
+    ok = kc.run_slash(f"complete {tid} --summary 'closing directly' --manual")
+    assert "Completed" in ok, ok
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+        run = conn.execute(
+            "SELECT metadata, synthesized FROM task_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert run["synthesized"] == 1
+        assert json.loads(run["metadata"] or "{}").get("manual_override") is True
+
+
 # ---------------------------------------------------------------------------
 # /kanban specify — slash surface (same entry point CLI + gateway use)
 # ---------------------------------------------------------------------------

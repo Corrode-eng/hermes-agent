@@ -506,6 +506,106 @@ def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
         conn.close()
 
 
+def test_legacy_task_runs_without_synthesized_column_backfills(tmp_path):
+    """A pre-existing ``task_runs`` table from before the ``synthesized``
+    column existed must both gain the column and have legacy fabricated
+    rows (worker_pid/claim_lock/claim_expires all NULL, zero-duration)
+    flipped to synthesized=1 on migration, while a genuine instant worker
+    run (worker_pid set) is left at 0 (t_c2fb9cfc)."""
+    import sqlite3
+    db_path = tmp_path / "legacy_runs.db"
+    # isolation_level=None matches the production connect() path (autocommit
+    # off, explicit BEGIN) — otherwise sqlite3's implicit deferred transaction
+    # from the INSERTs below is still open when the migrator's write_txn
+    # tries to BEGIN IMMEDIATE and it raises "already inside a transaction".
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            assignee TEXT,
+            current_run_id INTEGER,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            worker_pid INTEGER,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            started_at INTEGER,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE task_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            worker_pid INTEGER,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            outcome TEXT,
+            summary TEXT,
+            metadata TEXT,
+            error TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES "
+        "('t_fab', 'fabricated close', 'done', 1), "
+        "('t_real', 'real instant run', 'done', 1)"
+    )
+    # Fabricated handoff-preservation row: zero-duration, no claim ever.
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+        "worker_pid, started_at, ended_at, outcome) VALUES "
+        "('t_fab', 'completed', NULL, NULL, NULL, 100, 100, 'completed')"
+    )
+    # Genuine run: also zero-duration (fast worker) but carries a worker_pid,
+    # so it must NOT be swept up by the legacy backfill heuristic.
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+        "worker_pid, started_at, ended_at, outcome) VALUES "
+        "('t_real', 'completed', 'lock123', 200, 4242, 100, 100, 'completed')"
+    )
+
+    cols_before = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+    assert "synthesized" not in cols_before
+
+    kbc._migrate_add_optional_columns(conn)
+
+    cols_after = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+    assert "synthesized" in cols_after
+
+    fab = conn.execute(
+        "SELECT synthesized FROM task_runs WHERE task_id = 't_fab'"
+    ).fetchone()
+    real = conn.execute(
+        "SELECT synthesized FROM task_runs WHERE task_id = 't_real'"
+    ).fetchone()
+    assert fab["synthesized"] == 1
+    assert real["synthesized"] == 0
+
+    # Idempotent second run must not raise or re-flip anything.
+    kbc._migrate_add_optional_columns(conn)
+    fab2 = conn.execute(
+        "SELECT synthesized FROM task_runs WHERE task_id = 't_fab'"
+    ).fetchone()
+    assert fab2["synthesized"] == 1
+    conn.close()
+
+
 
 
 

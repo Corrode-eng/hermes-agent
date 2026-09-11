@@ -773,6 +773,7 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    synthesized: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -787,6 +788,7 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(row["metadata"]),
+            synthesized=int(row["synthesized"]) if "synthesized" in row.keys() else 0,
         )
 
 
@@ -993,7 +995,14 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- 1 when this row was synthesized by _synthesize_ended_run (a
+    -- zero-duration terminal-transition row for a never-claimed task,
+    -- e.g. `kanban complete` on a `ready` task) rather than written by
+    -- a real claimed worker run. Lets dashboards/audits tell a
+    -- QA-verified/manual close apart from an actual completed run —
+    -- both otherwise report outcome='completed' indistinguishably.
+    synthesized         INTEGER NOT NULL DEFAULT 0
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1942,8 +1951,8 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             status, outcome,
             summary, error, metadata,
-            started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            started_at, ended_at, synthesized
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         """,
         (
             task_id, profile, step_key, outcome, outcome, summary, error, _json_or_null(metadata),
@@ -2530,7 +2539,7 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    fire_lifecycle_hook: bool = True,
+    fire_lifecycle_hook: bool = True, manual_override: bool = False,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2541,6 +2550,12 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+    ``manual_override=True`` (set by the CLI's ``--manual`` flag) is stamped
+    onto the synthesized run's metadata and the ``completed`` event payload
+    when this completion has no real backing run, so a direct
+    ready/todo/blocked -> done close via ``hermes kanban complete`` is
+    distinguishable in the audit trail from a tool-driven ``kanban_complete``
+    by an actual worker.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2594,15 +2609,20 @@ def complete_task(
             if prior_status == "review" and not synth_summary and not synth_metadata:
                 synth_summary = _REVIEW_APPROVED_NOTE
                 synth_metadata = {"source_status": "review", "approval": "manual"}
+            if manual_override:
+                synth_metadata = {**(synth_metadata or {}), "manual_override": True}
             run_id = _synthesize_ended_run(
                 conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
             )
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
+        completed_payload = _completed_event_payload(result, event_summary, verified_cards, metadata)
+        if manual_override and run_id is not None:
+            completed_payload["manual_override"] = True
         _append_event(
             conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
+            completed_payload,
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)

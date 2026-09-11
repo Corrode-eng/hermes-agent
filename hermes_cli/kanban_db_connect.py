@@ -901,6 +901,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 )
 
     if _table_exists(conn, "task_runs"):
+        if "synthesized" not in _column_names(conn, "task_runs"):
+            _add_column_if_missing(
+                conn, "task_runs", "synthesized",
+                "synthesized INTEGER NOT NULL DEFAULT 0",
+            )
+            # Backfill legacy rows matching the fabricated-run shape written
+            # by _synthesize_ended_run before this column existed: a
+            # zero-duration row on a task that was never claimed (no
+            # worker_pid, no claim_lock/claim_expires ever set). Only rows
+            # matching that pattern flip — a genuine instant-completing
+            # worker run would also have a worker_pid, so it's excluded.
+            conn.execute(
+                "UPDATE task_runs SET synthesized = 1 "
+                "WHERE worker_pid IS NULL AND claim_lock IS NULL "
+                "AND claim_expires IS NULL AND started_at = ended_at"
+            )
         _backfill_legacy_inflight_runs(conn)
 
     # One-shot event-kind rename: old names still worked but were awkward on
@@ -1003,7 +1019,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, synthesized INTEGER NOT NULL DEFAULT 0)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",

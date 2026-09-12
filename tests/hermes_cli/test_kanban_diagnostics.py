@@ -216,6 +216,61 @@ def _triage_task():
 
 
 
+def test_done_without_real_run_fires_on_synthesized_flag():
+    """Fabricated handoff-preservation run (synthesized=1) on a done task
+    must self-report even though it has no completed-event or timestamp
+    weirdness — the flag alone is enough (t_c2fb9cfc)."""
+    now = int(time.time())
+    task = _task(status="done")
+    events = [_event("completed", ts=now - 60)]
+    runs = [{"id": 1, "outcome": "completed", "synthesized": 1, "worker_pid": None, "claim_lock": None}]
+    diags = kd.compute_task_diagnostics(task, events, runs, now=now)
+    kinds = {d.kind for d in diags}
+    assert "done_without_real_run" in kinds
+    d = next(d for d in diags if d.kind == "done_without_real_run")
+    assert d.data["synthesized"] is True
+    assert d.data["ever_claimed"] is False
+
+
+def test_done_without_real_run_fires_on_legacy_unclaimed_shape():
+    """Legacy rows written before the ``synthesized`` column existed still
+    trip the rule via the belt-and-suspenders signal: no claimed/spawned
+    event and no run carries a worker_pid/claim_lock."""
+    now = int(time.time())
+    task = _task(status="done")
+    events = [_event("created", ts=now - 120), _event("completed", ts=now - 60)]
+    runs = [{"id": 2, "outcome": "completed", "synthesized": 0, "worker_pid": None, "claim_lock": None}]
+    diags = kd.compute_task_diagnostics(task, events, runs, now=now)
+    kinds = {d.kind for d in diags}
+    assert "done_without_real_run" in kinds
+    d = next(d for d in diags if d.kind == "done_without_real_run")
+    assert d.data["synthesized"] is False
+    assert d.data["ever_claimed"] is False
+
+
+def test_done_without_real_run_clears_for_genuine_worker_completion():
+    """A real claimed-and-run task must never trip the rule — worker_pid
+    set and a claimed event both clear both signals."""
+    now = int(time.time())
+    task = _task(status="done")
+    events = [
+        _event("created", ts=now - 300),
+        _event("claimed", ts=now - 250),
+        _event("completed", ts=now - 60),
+    ]
+    runs = [{"id": 3, "outcome": "completed", "synthesized": 0, "worker_pid": 4242, "claim_lock": "abc"}]
+    diags = kd.compute_task_diagnostics(task, events, runs, now=now)
+    assert "done_without_real_run" not in {d.kind for d in diags}
+
+
+def test_done_without_real_run_ignores_non_done_tasks():
+    now = int(time.time())
+    task = _task(status="ready")
+    runs = [{"id": 4, "outcome": "completed", "synthesized": 1, "worker_pid": None, "claim_lock": None}]
+    diags = kd.compute_task_diagnostics(task, [], runs, now=now)
+    assert "done_without_real_run" not in {d.kind for d in diags}
+
+
 def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("warning", "warning") is True
     assert kd.severity_at_or_above("error", "warning") is True

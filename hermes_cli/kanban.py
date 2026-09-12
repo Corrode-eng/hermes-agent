@@ -861,6 +861,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return rc
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    manual = bool(getattr(args, "manual", False))
     # Handoff fields are per-run; refuse to copy them across N runs.
     if len(ids) > 1 and (summary or raw_meta):
         return _err("kanban: --summary / --metadata are per-task and can't be used "
@@ -879,9 +880,27 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
+            # A task with no live claim and no run ever recorded has never
+            # actually been worked; require an explicit --manual to close it
+            # directly, so a fabricated "handoff preservation" run doesn't
+            # silently masquerade as a real worker completion (t_c2fb9cfc).
+            if not manual and _worker_run_id_for(tid) is None:
+                task = kb.get_task(conn, tid)
+                if (
+                    task is not None and not task.claim_lock
+                    and not kb.latest_run(conn, tid)
+                ):
+                    fail_msg[tid] = (
+                        f"cannot complete {tid}: it was never claimed by a worker (no run on "
+                        f"record). Pass --manual to confirm this is an intentional direct close "
+                        f"(e.g. QA/operator verified it out-of-band); this stamps "
+                        f"manual_override=true so it's distinguishable from a tool-driven "
+                        f"completion in the audit trail."
+                    )
+                    return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                    expected_run_id=_worker_run_id_for(tid))
+                                    expected_run_id=_worker_run_id_for(tid), manual_override=manual)
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 

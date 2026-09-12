@@ -678,6 +678,68 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_done_without_real_run(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """``done`` task whose completion was never backed by an actual claimed
+    worker run — the drift class where ``_synthesize_ended_run`` fabricates
+    a zero-duration ``task_runs`` row (e.g. ``kanban complete`` landing
+    directly on a never-claimed ``ready``/``todo`` task) and that row is
+    otherwise indistinguishable from a genuine completed run (both report
+    outcome='completed'). Fires on either signal so it still catches legacy
+    rows written before ``task_runs.synthesized`` existed:
+
+    1. The latest run on record has ``synthesized == 1``, or
+    2. No run carries a ``worker_pid``/``claim_lock`` and there is no
+       ``claimed``/``spawned`` event in the task's history at all (belt and
+       suspenders for pre-flag rows / boards where runs weren't loaded).
+    """
+    if _task_field(task, "status") != "done":
+        return []
+
+    latest_run = _runs_newest_first(runs)[0] if runs else None
+
+    flagged_synthesized = bool(latest_run) and int(_task_field(latest_run, "synthesized", 0) or 0) == 1
+
+    ever_claimed = any(_event_kind(ev) in {"claimed", "spawned"} for ev in events)
+    never_really_ran = not ever_claimed and not any(
+        _task_field(r, "worker_pid") or _task_field(r, "claim_lock") for r in runs
+    )
+
+    if not flagged_synthesized and not never_really_ran:
+        return []
+
+    completed_ts = _latest_event_ts(events, {"completed"})
+    if completed_ts == 0:
+        completed_ts = int(_task_field(task, "completed_at", default=0) or 0)
+    if completed_ts == 0:
+        completed_ts = now
+
+    reason = (
+        "its latest run is flagged synthesized (a fabricated handoff-preservation row, "
+        "not a real worker completion)"
+        if flagged_synthesized else
+        "there is no claimed/spawned event and no run carries a worker_pid or claim_lock"
+    )
+    return [Diagnostic(
+        kind="done_without_real_run", severity="warning",
+        title="Task marked done without a real run",
+        detail=f"This task is 'done' but was apparently never claimed by a worker: {reason}. "
+               f"This usually means it was completed directly from ready/todo (CLI or tool-driven "
+               f"kanban_complete on a never-claimed task) rather than by an actual worker attempt. "
+               f"Verify the summary/result reflects real work before trusting this completion.",
+        actions=[
+            _cli_hint(f"Inspect runs: hermes kanban show {_task_field(task, 'id')} --json",
+                     f"hermes kanban show {_task_field(task, 'id')} --json", suggested=True),
+            DiagnosticAction(kind="comment", label="Add a comment noting the manual close"),
+        ],
+        first_seen_at=completed_ts, last_seen_at=completed_ts, count=1,
+        data={
+            "synthesized": flagged_synthesized,
+            "ever_claimed": ever_claimed,
+            "latest_run_id": _task_field(latest_run, "id") if latest_run else None,
+        },
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
@@ -689,6 +751,7 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_done_without_real_run,
 ]
 
 
@@ -790,5 +853,6 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "done_without_real_run",
 )
 # ---- END PLUGIN-COMPAT ----

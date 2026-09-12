@@ -696,6 +696,74 @@ def test_request_review_on_unclaimed_ready_synthesizes_run(kanban_home: Path) ->
         assert evs[0][1]["summary"] == "done without a claim"
 
 
+def _last_run_full(conn, tid):
+    row = conn.execute(
+        "SELECT status, outcome, summary, metadata, synthesized FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (tid,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "status": row["status"], "outcome": row["outcome"], "summary": row["summary"],
+        "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+        "synthesized": row["synthesized"],
+    }
+
+
+def test_complete_never_claimed_ready_flags_synthesized_run(kanban_home: Path) -> None:
+    """``complete_task`` on a never-claimed ``ready`` task fabricates a
+    zero-duration handoff-preservation run; that row must carry
+    ``synthesized=1`` so it's distinguishable from a genuine worker
+    completion in the audit trail (t_c2fb9cfc)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="never claimed", assignee="worker")
+        assert kb.get_task(conn, tid).current_run_id is None
+
+        ok = kb.complete_task(conn, tid, summary="closed without a claim")
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "done"
+
+        run = _last_run_full(conn, tid)
+        assert run is not None
+        assert run["synthesized"] == 1
+
+
+def test_complete_real_worker_run_stays_unflagged(kanban_home: Path) -> None:
+    """A genuine claim -> complete cycle must never set ``synthesized`` on
+    its run row — only the fabricated handoff-preservation path does."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="claimed then done", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        ok = kb.complete_task(conn, tid, summary="real work", expected_run_id=claimed.current_run_id)
+        assert ok is True
+
+        run = _last_run_full(conn, tid)
+        assert run is not None
+        assert run["synthesized"] == 0
+
+
+def test_complete_manual_override_stamps_metadata_and_event(kanban_home: Path) -> None:
+    """``manual_override=True`` (the CLI's ``--manual`` flag) must land on
+    both the synthesized run's metadata and the ``completed`` event
+    payload, so a direct CLI close is distinguishable from a tool-driven
+    ``kanban_complete`` in the audit trail."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="manual close", assignee="worker")
+        ok = kb.complete_task(conn, tid, summary="operator verified out-of-band", manual_override=True)
+        assert ok is True
+
+        run = _last_run_full(conn, tid)
+        assert run is not None
+        assert run["synthesized"] == 1
+        assert (run["metadata"] or {}).get("manual_override") is True
+
+        evs = _events(conn, tid, kind="completed")
+        assert len(evs) == 1
+        assert evs[0][1].get("manual_override") is True
+
+
 def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
     """An explicit reviewer routes the review run while preserving implementer provenance."""
     with kbc.connect() as conn:

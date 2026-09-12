@@ -284,6 +284,11 @@ _SPECS = [
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
+        _arg("--manual", action="store_true",
+             help="Required to complete a task that was never claimed by a worker (direct "
+                 "ready/todo/blocked -> done). Stamps manual_override=true on the closing run/event "
+                 "so this drift class is distinguishable from a tool-driven completion in the audit "
+                 "trail. Not needed for tasks with a real run (claimed/running/review)."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,

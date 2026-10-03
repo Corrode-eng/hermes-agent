@@ -1,11 +1,19 @@
 import { useStore } from '@nanostores/react'
-import { useEffect } from 'react'
+import { useEffect, useLayoutEffect } from 'react'
 
+import { endChatOnboardingSolo, takeGuideShape } from '@/components/onboarding-chat/assembly'
 import { isOnboardingEnabled } from '@/lib/onboarding-enabled'
 import { ackFreeTierNotice, type FreeTierRequester } from '@/store/free-tier'
-import { $introReveal } from '@/store/intro-reveal'
-import { clearFreeTierIntro } from '@/store/onboarding'
-import { $onboardingGate, runGuideKickoff } from '@/store/onboarding-gate'
+import { $desktopOnboarding, clearFreeTierIntro } from '@/store/onboarding'
+import {
+  $guideOpening,
+  $onboardingGate,
+  beginOnboardingFlow,
+  runGuideKickoff,
+  skipGuide
+} from '@/store/onboarding-gate'
+
+import { GuideLoading } from './guide-loading'
 
 interface OnboardingChatGateProps {
   enabled: boolean
@@ -15,31 +23,51 @@ interface OnboardingChatGateProps {
 
 export function OnboardingChatGate({ enabled, onKickoff, requestGateway }: OnboardingChatGateProps) {
   const gate = useStore($onboardingGate)
-  const intro = useStore($introReveal)
+  const opening = useStore($guideOpening)
+
+  useLayoutEffect(() => {
+    beginOnboardingFlow($desktopOnboarding.get().firstRunSkipped)
+
+    if ($onboardingGate.get().guideQueued) {
+      takeGuideShape()
+    }
+  }, [])
 
   useEffect(() => {
     if (!enabled || !isOnboardingEnabled()) {
       return
     }
 
-    // subscribe also sees an intro started by the preceding sibling's effect.
-    return $introReveal.subscribe(state => {
-      if (state.phase === 'playing') {
-        clearFreeTierIntro()
-        void ackFreeTierNotice(requestGateway).then(acked => {
-          if (acked) {
-            clearFreeTierIntro()
-          }
-        })
+    const ack = () => {
+      clearFreeTierIntro()
+      void ackFreeTierNotice(requestGateway).then(acked => {
+        if (acked) {
+          clearFreeTierIntro()
+        }
+      })
+    }
+
+    return $onboardingGate.subscribe(state => {
+      if (state.phase === 'guided') {
+        ack()
       }
     })
   }, [enabled, requestGateway])
 
   useEffect(() => {
-    if (enabled && gate.guideQueued && intro.phase === 'hidden') {
-      void runGuideKickoff(onKickoff)
-    }
-  }, [enabled, gate.guideQueued, intro.phase, onKickoff])
+    if (enabled && gate.guideQueued) {
+      const recover = () => {
+        endChatOnboardingSolo()
+        skipGuide()
+      }
 
-  return null
+      void runGuideKickoff(onKickoff).then(started => {
+        if (!started) {
+          recover()
+        }
+      }, recover)
+    }
+  }, [enabled, gate.guideQueued, onKickoff])
+
+  return opening ? <GuideLoading /> : null
 }

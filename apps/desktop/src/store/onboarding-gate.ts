@@ -1,14 +1,14 @@
-import { atom } from 'nanostores'
+import { atom, computed } from 'nanostores'
 
 import { isOnboardingEnabled } from '@/lib/onboarding-enabled'
 import { readKey, writeKey } from '@/lib/storage'
 
-import { hasSeenIntroReveal } from './intro-reveal'
+import { $gateway } from './gateway'
 import { DEFAULT_ANSWERS, setOnboardingAnswers } from './onboarding-answers'
 
 const PHASE_KEY = 'hermes-onboarding-phase-v1'
 
-export const ONBOARDING_PHASES = ['idle', 'cinematic', 'guided', 'skipped', 'handoff', 'done'] as const
+export const ONBOARDING_PHASES = ['idle', 'pending', 'guided', 'skipped', 'handoff', 'done'] as const
 
 export type OnboardingPhase = (typeof ONBOARDING_PHASES)[number]
 
@@ -19,6 +19,7 @@ function isOnboardingPhase(value: string | null): value is OnboardingPhase {
 export interface OnboardingGateState {
   phase: OnboardingPhase
   guideQueued: boolean
+  guideKickoff: 'idle' | 'starting' | 'started'
 }
 
 type GuideKickoff = { status: 'idle' } | { status: 'starting'; promise: Promise<boolean> } | { status: 'started' }
@@ -28,33 +29,47 @@ function loadGate(): OnboardingGateState {
 
   const phase = isOnboardingEnabled() && isOnboardingPhase(saved) ? saved : 'idle'
 
-  return { phase, guideQueued: phase === 'cinematic' && hasSeenIntroReveal() }
+  return {
+    phase,
+    guideQueued: phase === 'pending' || phase === 'guided',
+    guideKickoff: 'idle'
+  }
 }
 
 export const $onboardingGate = atom<OnboardingGateState>(loadGate())
 
 let guideKickoff: GuideKickoff = { status: 'idle' }
+export const $guideOpening = computed(
+  $onboardingGate,
+  gate =>
+    isOnboardingEnabled() && (gate.phase === 'pending' || gate.phase === 'guided') && gate.guideKickoff !== 'started'
+)
+
+function setGuideKickoff(state: GuideKickoff): void {
+  guideKickoff = state
+  $onboardingGate.set({ ...$onboardingGate.get(), guideKickoff: state.status })
+}
 
 function setPhase(phase: OnboardingPhase): void {
   writeKey(PHASE_KEY, phase === 'idle' ? null : phase)
-  $onboardingGate.set({ phase, guideQueued: false })
+  $onboardingGate.set({ ...$onboardingGate.get(), phase, guideQueued: false })
 }
 
-export function beginOnboardingFlow(): void {
-  if (isOnboardingEnabled() && $onboardingGate.get().phase === 'idle' && !hasSeenIntroReveal()) {
-    setPhase('cinematic')
+export function guidedOnboardingActive(): boolean {
+  const { phase } = $onboardingGate.get()
+
+  return isOnboardingEnabled() && (phase === 'pending' || phase === 'guided' || phase === 'handoff')
+}
+
+export function beginOnboardingFlow(firstRunSkipped: boolean): void {
+  if (!isOnboardingEnabled() || firstRunSkipped || $onboardingGate.get().phase !== 'idle') {
+    return
   }
+
+  setPhase('pending')
+  $onboardingGate.set({ ...$onboardingGate.get(), guideQueued: true })
 }
 
-export function queueGuideAfterIntro(): void {
-  const state = $onboardingGate.get()
-
-  if (isOnboardingEnabled() && state.phase === 'cinematic' && !state.guideQueued && hasSeenIntroReveal()) {
-    $onboardingGate.set({ ...state, guideQueued: true })
-  }
-}
-
-/** The kickoff returns true only after the guided session's seed is durable. */
 export function runGuideKickoff(kickoff: () => Promise<boolean>): Promise<boolean> {
   if (!isOnboardingEnabled()) {
     return Promise.resolve(false)
@@ -72,28 +87,26 @@ export function runGuideKickoff(kickoff: () => Promise<boolean>): Promise<boolea
     return Promise.resolve(false)
   }
 
-  // Defer the callback until the shared promise is installed, including for
-  // callers that re-enter synchronously while starting the session.
   const promise = Promise.resolve()
     .then(kickoff)
     .then(
       started => {
-        guideKickoff = { status: started ? 'started' : 'idle' }
+        setGuideKickoff({ status: started ? 'started' : 'idle' })
 
-        if (started && $onboardingGate.get().phase === 'cinematic') {
+        if (started && $onboardingGate.get().phase === 'pending') {
           setPhase('guided')
         }
 
         return started
       },
       error => {
-        guideKickoff = { status: 'idle' }
+        setGuideKickoff({ status: 'idle' })
 
         throw error
       }
     )
 
-  guideKickoff = { status: 'starting', promise }
+  setGuideKickoff({ status: 'starting', promise })
 
   return promise
 }
@@ -106,7 +119,6 @@ export function beginOnboardingHandoff(): void {
   }
 }
 
-/** Called when the handoff receipt is accepted. */
 export function completeOnboardingFlow(): void {
   if (isOnboardingEnabled() && $onboardingGate.get().phase === 'handoff') {
     setPhase('done')
@@ -116,19 +128,20 @@ export function completeOnboardingFlow(): void {
 export function skipGuide(): void {
   const { phase } = $onboardingGate.get()
 
-  if (isOnboardingEnabled() && (phase === 'cinematic' || phase === 'guided')) {
+  if (isOnboardingEnabled() && (phase === 'pending' || phase === 'guided')) {
     setPhase('skipped')
   }
 }
 
-export function devResetOnboardingFlow(): void {
+export async function devResetOnboardingFlow(): Promise<void> {
   if (!import.meta.env.DEV) {
     return
   }
 
-  guideKickoff = { status: 'idle' }
+  await $gateway.get()?.request('onboarding.reset_setup_profile', {})
+  setGuideKickoff({ status: 'idle' })
   setPhase('idle')
-  setOnboardingAnswers({ ...DEFAULT_ANSWERS, connectors: [...DEFAULT_ANSWERS.connectors] })
+  setOnboardingAnswers({ ...DEFAULT_ANSWERS, connectors: [], plugins: [], pluginOutcomes: {} })
 }
 
 declare global {

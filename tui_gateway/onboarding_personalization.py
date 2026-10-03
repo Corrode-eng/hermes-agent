@@ -1,4 +1,3 @@
-"""Explicit handoff of agreed setup facts, not shared profile memory."""
 import json
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -17,7 +16,8 @@ def remember_onboarding(answers: dict) -> dict:
             raise ValueError(f'{key} must be text')
         if value and value.strip():
             facts.append(f'{label}: {value.strip()}')
-    for key, label in (('focus', 'Focus areas'), ('connectors', 'Tools the user uses (not connection status)')):
+    for key, label in (('focus', 'Focus areas'), ('connectors', 'Tools the user uses (not connection status)'),
+                       ('plugins', 'Hermes plugins the user picked during onboarding (not install status)')):
         values = answers.get(key, [])
         if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
             raise ValueError(f'{key} must be a list of text')
@@ -29,14 +29,11 @@ def remember_onboarding(answers: dict) -> dict:
     if len(content) > 2000:
         raise ValueError('Onboarding facts are too long to remember')
 
-    # Resolve the named default through the same path authority as profiles,
-    # even when this RPC arrived on the guide's backend or a custom root.
     token = set_hermes_home_override(get_profile_dir('default'))
     try:
         result = json.loads(memory_tool(action='add', target='user', content=content, store=load_on_disk_store()))
         if not result.get('success') or result.get('staged'):
             raise ValueError(result.get('error') or result.get('message') or 'Memory was not saved')
-        # An ACK is not persistence: read back the exact entry on a fresh store.
         if content not in load_on_disk_store().user_entries:
             raise ValueError('Could not verify saved onboarding facts')
         return {'saved': True, 'profile': 'default', 'target': 'user'}

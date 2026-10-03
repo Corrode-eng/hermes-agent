@@ -1,5 +1,3 @@
-/** Failed/uncertain submits retain the original session;
- * they must never close it or start a second build. */
 import { JsonRpcGatewayError } from '@hermes/shared'
 
 import type { ClientSessionState } from '@/app/types'
@@ -19,8 +17,6 @@ export interface HandoffTask {
 export interface HandoffReceipt extends HandoffTask {
   runtimeId: string
   storedId: string
-  /** `connectionId: null` is the ambient route for the profile (a local-only
-   *  install, or a legacy primary with no registry id), never a missing owner. */
   owner: { connectionId: null | string; profile: typeof BUILD_PROFILE }
   status: 'created' | 'submitting' | 'accepted'
 }
@@ -47,8 +43,6 @@ export interface HandoffDeps {
   bind: (receipt: HandoffReceipt, running: boolean, snapshot?: HandoffSnapshot) => void
 }
 
-/** Only preflight refusals in methods_prompt authorize another submit. A
- * generic server error, like a lost ACK, may follow a side effect. */
 const PREFLIGHT_REJECTIONS = new Set([4001, 4004, 4009, 4018, 4090, 4091, 4120, 4121, 5070, 5071, 5072, 5122])
 
 interface HydratedHandoffSnapshot extends HandoffSnapshot {
@@ -86,9 +80,6 @@ export async function startHandoff(deps: HandoffDeps, task: HandoffTask, recover
 
     receipt = { ...receipt, runtimeId: snapshot.session_id }
 
-    // A visible user turn in this dedicated session is durable acceptance,
-    // even when the build has finished or its context has been compressed.
-    // A confirmed refusal (created) cannot be overturned by a stale busy flag.
     if (
       (receipt.status === 'submitting' && snapshot.running) ||
       snapshot.messages.some(message => message.role === 'user' && message.display_kind !== 'hidden')

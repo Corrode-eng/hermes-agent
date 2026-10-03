@@ -15,7 +15,6 @@ export function registerChatOnboardingWindow({ enabled, mainWindow }: ChatOnboar
       return
     }
 
-    // Renderer CSS pixels become native DIP here, including the user's zoom.
     const bounds = win.getBounds()
 
     win.setBounds(
